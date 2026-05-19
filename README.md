@@ -15,7 +15,9 @@ Automatically switches mouse sensitivity when you switch applications — no pol
 - KDE Plasma 6 (Wayland)
 - Python 3 with `dbus` and `PyGObject` (`python3-dbus`, `python3-gobject`)
 
-## Quick Install
+## Quick Install (Host)
+
+Installs the daemon and KWin script on your system:
 
 ```bash
 git clone https://github.com/A2nasB/SensAdapt.git
@@ -24,7 +26,29 @@ chmod +x install-sensadapt.sh
 ./install-sensadapt.sh
 ```
 
-Then find **SensAdapt** in your app launcher or run `sensadapt`.
+## Quick Install (Flatpak)
+
+The Flatpak contains the GUI manager only. You still need to install the daemon and KWin script on the host with `install-sensadapt.sh` for full functionality.
+
+### From Flathub (once published)
+
+```bash
+flatpak install flathub org.sensadapt.SensAdapt
+```
+
+### Build from source
+
+```bash
+flatpak install flathub org.gnome.Platform//47 org.gnome.Sdk//47
+flatpak install flathub org.flatpak.Builder
+flatpak run org.flatpak.Builder --force-clean --state-dir=flatpak-state --install --user build-dir org.sensadapt.SensAdapt.yml
+```
+
+Then run via **SensAdapt** in your app launcher or:
+
+```bash
+flatpak run org.sensadapt.SensAdapt
+```
 
 ## Usage
 

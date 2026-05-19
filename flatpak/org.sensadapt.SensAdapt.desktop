@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=SensAdapt
+Comment=Per-window mouse pointer acceleration profiles
+Exec=sensadapt
+Icon=org.sensadapt.SensAdapt
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+StartupNotify=true

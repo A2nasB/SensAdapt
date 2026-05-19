@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component type="desktop-application">
+  <id>org.sensadapt.SensAdapt</id>
+  <name>SensAdapt</name>
+  <summary>Per-window mouse sensitivity profiles for KDE Plasma 6</summary>
+  <developer id="org.sensadapt">
+    <name>A2nasB</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0</project_license>
+  <description>
+    <p>
+      Automatically switch mouse pointer acceleration per focused window on KDE Plasma 6 (Wayland).
+      No polling, no cursor glitches.
+    </p>
+    <p>
+      SensAdapt uses a KWin Script to detect window focus changes and instantly
+      adjusts your mouse sensitivity based on per-application profiles.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Per-window mouse speed profiles</li>
+      <li>Event-driven — no polling, instant switching</li>
+      <li>Auto-detects any pointing device</li>
+      <li>GTK4 graphical interface</li>
+      <li>System tray integration</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.sensadapt.SensAdapt.desktop</launchable>
+  <url type="homepage">https://github.com/A2nasB/SensAdapt</url>
+  <url type="bugtracker">https://github.com/A2nasB/SensAdapt/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/A2nasB/SensAdapt/main/Screenshot_20260520_022713.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="1.0" date="2026-05-20"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>
