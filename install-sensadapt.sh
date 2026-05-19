@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_URL="https://github.com/YOUR_USER/sensadapt"  # <-- update this before publishing
+REPO_URL="https://github.com/A2nasB/SensAdapt"
 BIN="$HOME/.local/bin"
 CONFIG="$HOME/.config"
 APPS="$HOME/.local/share/applications"
