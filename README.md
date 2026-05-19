@@ -18,8 +18,8 @@ Automatically switches mouse sensitivity when you switch applications — no pol
 ## Quick Install
 
 ```bash
-git clone https://github.com/YOUR_USER/sensadapt.git
-cd sensadapt
+git clone https://github.com/A2nasB/SensAdapt.git
+cd SensAdapt
 chmod +x install-sensadapt.sh
 ./install-sensadapt.sh
 ```
@@ -70,6 +70,14 @@ rm -f ~/.config/autostart/sensadapt.desktop
 rm -f ~/.config/systemd/user/sensadapt.service
 ```
 
+## Screenshot
+
+![SensAdapt](Screenshot_20260520_022713.png)
+
 ## License
 
 GPL-3.0
+
+---
+
+*Created with [opencode](https://opencode.ai) and Claude.*
