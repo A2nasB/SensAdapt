@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+CONFIG_PATH = Path.home() / ".config" / "sensadapt.json"
+SERVICE_NAME = "org.sensadapt.Switcher"
+OBJECT_PATH = "/org/sensadapt/Switcher"
+
+def qdbus(*args):
+    try:
+        raw = subprocess.run(["qdbus", *args], capture_output=True, text=True, timeout=2)
+        return raw.stdout.strip() if raw.returncode == 0 else None
+    except Exception:
+        return None
+
+def list_devices():
+    out = qdbus("org.kde.KWin")
+    if not out:
+        return []
+    return [l.strip() for l in out.split("\n") if "InputDevice/event" in l]
+
+def device_prop(path, prop):
+    raw = qdbus("org.kde.KWin", path, "org.freedesktop.DBus.Properties.Get",
+                "org.kde.KWin.InputDevice", prop)
+    return raw.strip('"') if raw else None
+
+def detect_mice():
+    mice = []
+    for path in list_devices():
+        is_ptr = device_prop(path, "pointer")
+        if is_ptr == "true":
+            name = device_prop(path, "name") or path
+            mice.append({"path": path, "name": name})
+    return mice
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def save_config(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+def resolve_device(config):
+    cfg_path = config.get("device_path")
+    if cfg_path:
+        name = device_prop(cfg_path, "name")
+        if name is not None:
+            return cfg_path, name
+    mice = detect_mice()
+    if not mice:
+        print("No mouse devices found!", flush=True)
+        return None, None
+    dev = mice[0]
+    config["device_path"] = dev["path"]
+    config["device_name"] = dev["name"]
+    save_config(config)
+    return dev["path"], dev["name"]
+
+def set_speed(value, device_path):
+    value = max(-1.0, min(1.0, float(value)))
+    subprocess.run(
+        ["dbus-send", "--session", "--dest=org.kde.KWin",
+         "--type=method_call",
+         device_path,
+         "org.freedesktop.DBus.Properties.Set",
+         "string:org.kde.KWin.InputDevice",
+         "string:pointerAcceleration",
+         f"variant:double:{value}"],
+        capture_output=True, timeout=3,
+    )
+
+def match_profile(rc, caption, df, profile):
+    rc = rc.lower()
+    caption = caption.lower()
+    df = df.lower()
+    for m in profile.get("match", []):
+        ml = m.lower()
+        if ml in rc or ml in caption or ml in df:
+            return True
+    return False
+
+def apply_profile(rc, caption, df, profiles, device_path):
+    default = profiles.get("default", {"speed": 0.0})
+    custom = {k: v for k, v in profiles.items() if k != "default"}
+    settings = dict(default)
+    matched = "default"
+    for pname, pcfg in custom.items():
+        if match_profile(rc, caption, df, pcfg):
+            settings.update({k: v for k, v in pcfg.items() if k != "match"})
+            matched = pname
+            break
+    label = rc if rc else "(desktop)"
+    print(f"[{time.strftime('%H:%M:%S')}] {label} -> {matched}", flush=True)
+    if "speed" in settings:
+        set_speed(settings["speed"], device_path)
+        print(f"  speed -> {settings['speed']}", flush=True)
+
+class SensAdaptDaemon(dbus.service.Object):
+    def __init__(self, device_path):
+        self.device_path = device_path
+        bus_name = dbus.service.BusName(SERVICE_NAME, dbus.SessionBus())
+        super().__init__(bus_name, OBJECT_PATH)
+        print(f"DBus service registered: {SERVICE_NAME}", flush=True)
+
+    @dbus.service.method(
+        dbus_interface=SERVICE_NAME,
+        in_signature="sss",
+        out_signature=""
+    )
+    def Activate(self, resource_class, caption, desktop_file):
+        config = load_config()
+        apply_profile(
+            str(resource_class), str(caption), str(desktop_file),
+            config.get("profiles", {}), self.device_path
+        )
+
+    @dbus.service.method(
+        dbus_interface=SERVICE_NAME,
+        in_signature="",
+        out_signature="s"
+    )
+    def GetDevicePath(self):
+        return self.device_path
+
+def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("usage: sensadapt-daemon"); return
+
+    config = load_config()
+    if not config:
+        default = {"profiles": {"default": {"speed": 0.8}}}
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(default, f, indent=2)
+        print(f"Created config at {CONFIG_PATH}"); sys.exit(0)
+
+    device_path, device_name = resolve_device(config)
+    if not device_path:
+        print("No mouse found. Exiting.", flush=True); sys.exit(1)
+    print(f"Device: {device_name} ({device_path})", flush=True)
+
+    DBusGMainLoop(set_as_default=True)
+    daemon = SensAdaptDaemon(device_path)
+    print("Waiting for focus events from KWin script. Ctrl+C to stop.\n", flush=True)
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+if __name__ == "__main__":
+    main()

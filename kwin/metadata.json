@@ -1,0 +1,11 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Name": "SensAdapt Watcher",
+        "Description": "Calls sensadapt-daemon on window focus change",
+        "Version": "1.0",
+        "License": "MIT",
+        "Id": "sensadapt-watcher"
+    },
+    "X-Plasma-API": "javascript"
+}

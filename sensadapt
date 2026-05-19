@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+import os
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib
+
+CONFIG_PATH = Path.home() / ".config" / "sensadapt.json"
+AUTOSTART_PATH = Path.home() / ".config" / "autostart" / "sensadapt.desktop"
+SERVICE_NAME = "org.sensadapt.Switcher"
+OBJECT_PATH = "/org/sensadapt/Switcher"
+
+def qdbus(*args):
+    try:
+        raw = subprocess.run(["qdbus", *args], capture_output=True, text=True, timeout=2)
+        return raw.stdout.strip() if raw.returncode == 0 else None
+    except Exception:
+        return None
+
+def parse_info(raw):
+    if not raw:
+        return None
+    info = {}
+    for line in raw.split("\n"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            info[k.strip()] = v.strip()
+    return info
+
+def get_active_window():
+    return parse_info(qdbus("org.kde.KWin", "/KWin", "org.kde.KWin.queryWindowInfo"))
+
+def list_devices():
+    out = qdbus("org.kde.KWin")
+    if not out:
+        return []
+    return [l.strip() for l in out.split("\n") if "InputDevice/event" in l]
+
+def device_prop(path, prop):
+    raw = qdbus("org.kde.KWin", path, "org.freedesktop.DBus.Properties.Get",
+                "org.kde.KWin.InputDevice", prop)
+    return raw.strip('"') if raw else None
+
+def detect_mice():
+    mice = []
+    for path in list_devices():
+        is_ptr = device_prop(path, "pointer")
+        if is_ptr == "true":
+            mice.append({"path": path, "name": device_prop(path, "name") or path})
+    return mice
+
+def load():
+    if not CONFIG_PATH.exists():
+        return {"profiles": {"default": {"speed": 0.8}}}
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def save(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+def lookup_icon_name(desktop_file):
+    if not desktop_file:
+        return None
+    for d in ["/usr/share/applications", str(Path.home() / ".local/share/applications")]:
+        path = Path(d) / f"{desktop_file}.desktop"
+        if path.exists():
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("Icon="):
+                        return line.strip().split("=", 1)[1]
+    return None
+
+def daemon_is_autostart():
+    r = subprocess.run(["systemctl", "--user", "is-enabled", "sensadapt.service"],
+                       capture_output=True, text=True, timeout=5)
+    return r.stdout.strip() == "enabled"
+
+def set_daemon_autostart(enabled):
+    if enabled:
+        subprocess.run(["systemctl", "--user", "enable", "--now", "sensadapt.service"],
+                       capture_output=True, timeout=10)
+    else:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "sensadapt.service"],
+                       capture_output=True, timeout=10)
+
+def gui_autostart_enabled():
+    return AUTOSTART_PATH.exists()
+
+def set_gui_autostart(enabled):
+    if enabled:
+        AUTOSTART_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUTOSTART_PATH, "w") as f:
+            f.write(f"""[Desktop Entry]
+Name=SensAdapt
+Comment=Per-window mouse sensitivity profiles
+Exec={Path.home() / ".local/bin/sensadapt"}
+Icon=preferences-desktop-mouse
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+X-KDE-autostart-after=plasma-kwin_wayland.service
+""")
+    else:
+        AUTOSTART_PATH.unlink(missing_ok=True)
+
+def apply_theme(config):
+    theme = config.get("theme", "system")
+    style = Adw.StyleManager.get_default()
+    if theme == "dark":
+        style.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+    elif theme == "light":
+        style.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
+    else:
+        style.set_color_scheme(Adw.ColorScheme.PREFER_LIGHT)
+
+# ── Tray Icon (StatusNotifierItem) ───────────────────────────────────────
+
+import dbus, dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+
+SNW_BUS = "org.kde.StatusNotifierWatcher"
+SNW_PATH = "/StatusNotifierWatcher"
+SNW_IFACE = "org.kde.StatusNotifierWatcher"
+
+SNI_IFACE = "org.kde.StatusNotifierItem"
+DBUSMENU_IFACE = "com.canonical.dbusmenu"
+DBUSMENU_PATH = "/com/canonical/DBusMenu"
+
+class DBusMenu(dbus.service.Object):
+    def __init__(self, conn, on_open, on_quit):
+        self._revision = 0
+        self.on_open = on_open
+        self.on_quit = on_quit
+        super().__init__(conn, DBUSMENU_PATH)
+
+    @dbus.service.method(DBUSMENU_IFACE, in_signature="iis", out_signature="u(ia{sv}av)")
+    def GetLayout(self, parent_id, depth, props):
+        open_item = dbus.types.Struct([
+            dbus.types.Int32(1),
+            dbus.types.Dictionary({"label": "Open SensAdapt", "type": "standard", "enabled": True}, signature="sv"),
+            dbus.types.Array([], signature="v"),
+        ])
+        quit_item = dbus.types.Struct([
+            dbus.types.Int32(2),
+            dbus.types.Dictionary({"label": "Quit", "type": "standard", "enabled": True}, signature="sv"),
+            dbus.types.Array([], signature="v"),
+        ])
+        return (
+            dbus.types.UInt32(self._revision),
+            dbus.types.Struct([
+                dbus.types.Int32(0),
+                dbus.types.Dictionary({}, signature="sv"),
+                dbus.types.Array([open_item, quit_item], signature="v"),
+            ]),
+        )
+
+    @dbus.service.method(DBUSMENU_IFACE, in_signature="ai", out_signature="a(ia{sv})")
+    def GetGroupProperties(self, ids):
+        return []
+
+    @dbus.service.method(DBUSMENU_IFACE, in_signature="isvu", out_signature="")
+    def Event(self, item_id, event_id, data, timestamp):
+        if event_id == "clicked":
+            if item_id == 1:
+                self.on_open()
+            elif item_id == 2:
+                self.on_quit()
+
+class StatusNotifierItem(dbus.service.Object):
+    _props = {
+        "Category": "ApplicationStatus",
+        "Id": "sensadapt",
+        "Title": "SensAdapt",
+        "Status": "Active",
+        "IconName": "preferences-desktop-mouse",
+        "IconThemePath": "",
+        "ItemIsMenu": False,
+        "Menu": dbus.ObjectPath(DBUSMENU_PATH),
+    }
+
+    def __init__(self, window, on_activate, on_quit):
+        self._window = window
+        self.on_activate = on_activate
+        self.on_quit = on_quit
+        self._id = f"org.sensadapt.tray.pid{os.getpid()}"
+        bus = dbus.SessionBus()
+        bus_name = dbus.service.BusName(self._id, bus)
+        super().__init__(bus_name, "/StatusNotifierItem")
+        self._menu = DBusMenu(bus, on_activate, on_quit)
+        self._register()
+
+    def _register(self):
+        try:
+            bus = dbus.SessionBus()
+            obj = bus.get_object(SNW_BUS, SNW_PATH)
+            iface = dbus.Interface(obj, SNW_IFACE)
+            iface.RegisterStatusNotifierItem(self._id)
+        except Exception:
+            pass
+
+    @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+    def Activate(self, x, y):
+        self.on_activate()
+
+    @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+    def ContextMenu(self, x, y):
+        pass
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        if interface == SNI_IFACE and prop in self._props:
+            return self._props[prop]
+        raise dbus.exceptions.DBusException(
+            "org.freedesktop.DBus.Error.InvalidArgs")
+
+    @dbus.service.method("org.freedesktop.DBus.Properties",
+                         in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface == SNI_IFACE:
+            return {k: v for k, v in self._props.items()}
+        return {}
+
+# ── Settings Dialog ──────────────────────────────────────────────────────
+
+class SettingsDialog(Gtk.Window):
+    def __init__(self, parent, config):
+        super().__init__()
+        self.set_transient_for(parent)
+        self.set_modal(True)
+        self.set_title("SensAdapt Settings")
+        self.set_default_size(400, 300)
+        self.config = config
+        self.parent_win = parent
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_top(20)
+        vbox.set_margin_bottom(20)
+        vbox.set_margin_start(20)
+        vbox.set_margin_end(20)
+        self.set_child(vbox)
+
+        h = Gtk.Label()
+        h.set_markup("<b>Startup</b>")
+        h.set_xalign(0)
+        vbox.append(h)
+
+        self.daemon_switch = Gtk.Switch()
+        self.daemon_switch.set_active(daemon_is_autostart())
+        self.daemon_switch.connect("notify::active", self.on_daemon_toggle)
+        r = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        r.append(Gtk.Label(label="Auto-start daemon (background service)", xalign=0))
+        r.append(self.daemon_switch)
+        vbox.append(r)
+
+        self.gui_switch = Gtk.Switch()
+        self.gui_switch.set_active(gui_autostart_enabled())
+        self.gui_switch.connect("notify::active", self.on_gui_toggle)
+        r2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        r2.append(Gtk.Label(label="Auto-start GUI on login", xalign=0))
+        r2.append(self.gui_switch)
+        vbox.append(r2)
+
+        vbox.append(Gtk.Label(label=""))
+
+        h2 = Gtk.Label()
+        h2.set_markup("<b>Appearance</b>")
+        h2.set_xalign(0)
+        vbox.append(h2)
+
+        theme_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        theme_row.append(Gtk.Label(label="Theme:", xalign=0))
+        self.theme_store = Gtk.StringList.new(["System", "Dark", "Light"])
+        self.theme_dropdown = Gtk.DropDown(model=self.theme_store)
+        theme_map = {"system": 0, "dark": 1, "light": 2}
+        self.theme_dropdown.set_selected(theme_map.get(config.get("theme", "system"), 0))
+        self.theme_dropdown.connect("notify::selected", self.on_theme_changed)
+        theme_row.append(self.theme_dropdown)
+        vbox.append(theme_row)
+
+        vbox.append(Gtk.Label(label=""))
+
+        self.minimize_switch = Gtk.Switch()
+        self.minimize_switch.set_active(config.get("minimize_to_tray", True))
+        self.minimize_switch.connect("notify::active", self.on_minimize_toggle)
+        r3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        r3.append(Gtk.Label(label="Minimize to tray on close", xalign=0))
+        r3.append(self.minimize_switch)
+        vbox.append(r3)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda b: self.close())
+        btn_box.append(close_btn)
+        vbox.append(btn_box)
+
+        self.present()
+
+    def on_daemon_toggle(self, sw, pspec):
+        set_daemon_autostart(sw.get_active())
+
+    def on_gui_toggle(self, sw, pspec):
+        set_gui_autostart(sw.get_active())
+
+    def on_theme_changed(self, dd, pspec):
+        idx = dd.get_selected()
+        names = ["system", "dark", "light"]
+        self.config["theme"] = names[idx]
+        save(self.config)
+        apply_theme(self.config)
+        self.parent_win.set_theme(self.config["theme"])
+
+    def on_minimize_toggle(self, sw, pspec):
+        self.config["minimize_to_tray"] = sw.get_active()
+        save(self.config)
+
+# ── Profile Edit Dialog ──────────────────────────────────────────────────
+
+class AddEditDialog(Gtk.Window):
+    def __init__(self, parent, config, profile_name=None):
+        super().__init__()
+        self.set_transient_for(parent)
+        self.set_modal(True)
+        self.set_title("Edit Profile" if profile_name else "Add Profile")
+        self.set_default_size(480, 320)
+        self.config = config
+        self.parent_win = parent
+        self.profile_name = profile_name
+        self.editing = profile_name is not None
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_top(20)
+        vbox.set_margin_bottom(20)
+        vbox.set_margin_start(20)
+        vbox.set_margin_end(20)
+        self.set_child(vbox)
+
+        self.name_entry = Gtk.Entry(placeholder_text="Profile name (e.g. overwatch)")
+        self.name_entry.set_text(profile_name or "")
+        vbox.append(self.name_entry)
+
+        frame = Gtk.Frame(label="Application")
+        app_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        app_box.set_margin_top(8)
+        app_box.set_margin_bottom(8)
+        app_box.set_margin_start(8)
+        app_box.set_margin_end(8)
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        cap_btn = Gtk.Button(label="Capture focused window")
+        cap_btn.connect("clicked", self.on_capture)
+        btn_row.append(cap_btn)
+        browse_btn = Gtk.Button(label="Browse for .exe\u2026")
+        browse_btn.connect("clicked", self.on_browse)
+        btn_row.append(browse_btn)
+        app_box.append(btn_row)
+        self.icon_img = Gtk.Image()
+        self.icon_img.set_pixel_size(32)
+        app_box.append(self.icon_img)
+        self.match_entry = Gtk.Entry(placeholder_text="Match (comma-separated)")
+        if self.editing:
+            p = config["profiles"].get(profile_name, {})
+            self.match_entry.set_text(", ".join(p.get("match", [])))
+        app_box.append(self.match_entry)
+        self.cap_label = Gtk.Label(label="", xalign=0)
+        app_box.append(self.cap_label)
+        frame.set_child(app_box)
+        vbox.append(frame)
+
+        speed_frame = Gtk.Frame(label="Speed")
+        speed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        speed_box.set_margin_top(8)
+        speed_box.set_margin_bottom(8)
+        speed_box.set_margin_start(8)
+        speed_box.set_margin_end(8)
+        scale_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        scale_row.append(Gtk.Label(label="-1.0"))
+        self.speed_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -1.0, 1.0, 0.01)
+        self.speed_scale.set_hexpand(True)
+        self.speed_scale.set_draw_value(False)
+        default_speed = config["profiles"].get(profile_name, {}).get("speed", 0.8) if profile_name else 0.8
+        self.speed_scale.set_value(default_speed)
+        scale_row.append(self.speed_scale)
+        scale_row.append(Gtk.Label(label="1.0"))
+        speed_box.append(scale_row)
+        spin_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        spin_row.append(Gtk.Label(label="Value:"))
+        self.speed_spin = Gtk.SpinButton.new_with_range(-5.0, 5.0, 0.01)
+        self.speed_spin.set_value(default_speed)
+        self.speed_spin.set_numeric(True)
+        self.speed_spin.set_activates_default(True)
+        self.speed_spin.set_width_chars(6)
+        spin_row.append(self.speed_spin)
+        speed_box.append(spin_row)
+        speed_frame.set_child(speed_box)
+        vbox.append(speed_frame)
+
+        self.speed_scale.connect("value-changed", lambda s: self.speed_spin.set_value(s.get_value()))
+        self.speed_spin.connect("value-changed", self.on_spin_changed)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
+        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn.connect("clicked", lambda b: self.close())
+        btn_box.append(cancel_btn)
+        save_btn = Gtk.Button(label="Save")
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("clicked", self.on_save)
+        btn_box.append(save_btn)
+        vbox.append(btn_box)
+        self.present()
+
+    def on_spin_changed(self, spin):
+        val = spin.get_value()
+        if -1.0 <= val <= 1.0:
+            self.speed_scale.set_value(val)
+
+    def on_capture(self, btn):
+        info = get_active_window()
+        if not info or not info.get("resourceClass"):
+            self.cap_label.set_label("No window focused"); return
+        rc = info["resourceClass"]
+        if rc.lower() in ("python3", "sensadapt", "mouse-profile-manager"):
+            self.cap_label.set_label(f"Ignored: {rc} (manager itself)"); return
+        self.match_entry.set_text(rc)
+        self.cap_label.set_label(f"Detected: {rc}")
+        icon_name = lookup_icon_name(info.get("desktopFile"))
+        if icon_name:
+            self.icon_img.set_from_icon_name(icon_name)
+            self.icon_img.set_visible(True)
+        if not self.name_entry.get_text():
+            self.name_entry.set_text(rc)
+
+    def on_browse(self, btn):
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Select an executable")
+        f = Gtk.FileFilter()
+        f.add_suffix("exe")
+        f.add_mime_type("application/x-ms-dos-executable")
+        f.add_mime_type("application/x-executable")
+        f.set_name("Executables")
+        dialog.set_default_filter(f)
+        dialog.open(None, None, self.on_browse_result, None)
+
+    def on_browse_result(self, dialog, result, data):
+        try:
+            file = dialog.open_finish(result)
+            if file:
+                path = file.get_path()
+                name = Path(path).stem
+                self.match_entry.set_text(name)
+                self.cap_label.set_label(f"Selected: {path}")
+                if not self.name_entry.get_text():
+                    self.name_entry.set_text(name)
+        except GLib.GError:
+            pass
+
+    def on_save(self, btn):
+        name = self.name_entry.get_text().strip()
+        match_text = self.match_entry.get_text().strip()
+        speed = self.speed_spin.get_value()
+        if not name:
+            self.cap_label.set_label("Name is required"); return
+        matches = [m.strip() for m in match_text.split(",") if m.strip()]
+        old_name = self.profile_name
+        if old_name and old_name in self.config["profiles"]:
+            del self.config["profiles"][old_name]
+        self.config["profiles"][name] = {"speed": round(speed, 2)}
+        if matches:
+            self.config["profiles"][name]["match"] = matches
+        save(self.config)
+        self.parent_win.refresh()
+        self.close()
+
+# ── Profile Row ──────────────────────────────────────────────────────────
+
+class ProfileRow(Gtk.Box):
+    def __init__(self, name, pcfg):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
+        icon = Gtk.Image()
+        icon.set_pixel_size(24)
+        icon.set_from_icon_name("application-x-executable")
+        matches = pcfg.get("match", [])
+        if matches:
+            icon_name = lookup_icon_name(matches[0])
+            if icon_name:
+                icon.set_from_icon_name(icon_name)
+        self.append(icon)
+        n = Gtk.Label(label=name, xalign=0)
+        n.set_width_chars(14)
+        n.set_css_classes(["heading"])
+        self.append(n)
+        rc = ", ".join(matches) if matches else "*"
+        m = Gtk.Label(label=rc, xalign=0)
+        m.set_hexpand(True)
+        m.set_opacity(0.7)
+        self.append(m)
+        self.speed_label = Gtk.Label(label=f"{pcfg.get('speed', 0.0):+.2f}", xalign=1)
+        self.speed_label.set_css_classes(["numeric"])
+        self.append(self.speed_label)
+
+# ── Main Window ──────────────────────────────────────────────────────────
+
+class ManagerWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_title("SensAdapt")
+        self.set_default_size(650, 500)
+        self.config = load()
+        self.tray = None
+        apply_theme(self.config)
+
+        self.set_icon_name("preferences-desktop-mouse")
+
+        device_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        device_row.set_margin_top(8)
+        device_row.set_margin_start(8)
+        device_row.set_margin_end(8)
+        device_row.append(Gtk.Label(label="Device:"))
+        self.device_names = Gtk.StringList.new([])
+        self.device_paths = []
+        self.device_dropdown = Gtk.DropDown(model=self.device_names)
+        device_row.append(self.device_dropdown)
+
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        toolbar.set_margin_top(4)
+        toolbar.set_margin_bottom(8)
+        toolbar.set_margin_start(8)
+        toolbar.set_margin_end(8)
+
+        add_btn = Gtk.Button(label="\u2795 Add")
+        add_btn.connect("clicked", self.on_add)
+        toolbar.append(add_btn)
+        edit_btn = Gtk.Button(label="\u270f Edit")
+        edit_btn.connect("clicked", self.on_edit)
+        toolbar.append(edit_btn)
+        del_btn = Gtk.Button(label="\u2716 Delete")
+        del_btn.connect("clicked", self.on_delete)
+        toolbar.append(del_btn)
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        toolbar.append(sep)
+        settings_btn = Gtk.Button(label="\u2699 Settings")
+        settings_btn.connect("clicked", self.on_settings)
+        toolbar.append(settings_btn)
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        toolbar.append(sep2)
+        self.status_label = Gtk.Label(label="")
+        toolbar.append(self.status_label)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        self.list = Gtk.ListBox()
+        self.list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.list.connect("row-selected", self.on_select)
+        scrolled.set_child(self.list)
+
+        self.speed_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.speed_panel.set_margin_top(8)
+        self.speed_panel.set_margin_bottom(8)
+        self.speed_panel.set_margin_start(12)
+        self.speed_panel.set_margin_end(12)
+        sep3 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self.speed_panel.append(sep3)
+        self.info_label = Gtk.Label(label="", xalign=0)
+        self.info_label.set_margin_top(4)
+        self.speed_panel.append(self.info_label)
+        scale_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        scale_row.append(Gtk.Label(label="-1.0"))
+        self.inline_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -1.0, 1.0, 0.01)
+        self.inline_scale.set_hexpand(True)
+        self.inline_scale.set_draw_value(False)
+        scale_row.append(self.inline_scale)
+        scale_row.append(Gtk.Label(label="1.0"))
+        self.speed_panel.append(scale_row)
+        spin_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        spin_row.append(Gtk.Label(label="Value:"))
+        self.inline_spin = Gtk.SpinButton.new_with_range(-5.0, 5.0, 0.01)
+        self.inline_spin.set_numeric(True)
+        self.inline_spin.set_activates_default(True)
+        self.inline_spin.set_width_chars(6)
+        spin_row.append(self.inline_spin)
+        self.speed_panel.append(spin_row)
+        self.inline_scale.connect("value-changed", self.on_inline_speed_change)
+        self.inline_spin.connect("value-changed", self.on_inline_spin_change)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vbox.append(device_row)
+        vbox.append(toolbar)
+        vbox.append(scrolled)
+        vbox.append(self.speed_panel)
+        self.set_child(vbox)
+
+        self._updating = False
+        self.populate_devices()
+        self.device_dropdown.connect("notify::selected", self.on_device_changed)
+        self.refresh()
+
+        if self.config.get("minimize_to_tray", True):
+            self.connect("close-request", self.on_close_request)
+            self.setup_tray()
+        else:
+            self.connect("close-request", lambda w: False)
+
+    def set_theme(self, theme):
+        pass
+
+    def setup_tray(self):
+        if self.tray:
+            return
+        try:
+            self.tray = StatusNotifierItem(self, self.present, self.quit_app)
+        except Exception:
+            self.tray = None
+
+    def on_close_request(self, win):
+        self.set_visible(False)
+        return True
+
+    def quit_app(self):
+        self.get_application().quit()
+
+    def refresh(self):
+        self._updating = True
+        self.config = load()
+        while True:
+            row = self.list.get_row_at_index(0)
+            if not row:
+                break
+            self.list.remove(row)
+        for name, pcfg in self.config.get("profiles", {}).items():
+            row = Gtk.ListBoxRow()
+            row.set_child(ProfileRow(name, pcfg))
+            row._name = name
+            self.list.append(row)
+        n = len(self.config.get("profiles", {}))
+        self.status_label.set_label(f"{n} profile{'s' if n != 1 else ''}")
+        self.speed_panel.set_visible(False)
+        self._updating = False
+
+    def selected_name(self):
+        row = self.list.get_selected_row()
+        return row._name if row else None
+
+    def populate_devices(self):
+        while self.device_names.get_n_items():
+            self.device_names.remove(0)
+        self.device_paths = []
+        mice = detect_mice()
+        selected_idx = 0
+        for i, m in enumerate(mice):
+            self.device_names.append(m["name"])
+            self.device_paths.append(m["path"])
+            if m["path"] == self.config.get("device_path"):
+                selected_idx = i
+        self.device_dropdown.set_selected(selected_idx)
+
+    def on_device_changed(self, dropdown, pspec):
+        idx = dropdown.get_selected()
+        if idx < 0 or idx >= len(self.device_paths):
+            return
+        self.config["device_path"] = self.device_paths[idx]
+        self.config["device_name"] = self.device_names.get_string(idx)
+        save(self.config)
+
+    def on_select(self, lb, row):
+        if self._updating or not row:
+            self.speed_panel.set_visible(False) if not row else None
+            return
+        name = row._name
+        p = self.config.get("profiles", {}).get(name, {})
+        speed = p.get("speed", 0.8)
+        matches = ", ".join(p.get("match", ["*"]))
+        self.info_label.set_label(f"{name}  |  match: {matches}")
+        self._updating = True
+        self.inline_scale.set_value(speed)
+        self.inline_spin.set_value(speed)
+        self._updating = False
+        self.speed_panel.set_visible(True)
+
+    def on_inline_speed_change(self, scale):
+        if self._updating:
+            return
+        val = scale.get_value()
+        self._updating = True
+        self.inline_spin.set_value(val)
+        self._updating = False
+        self.save_selected_speed(val)
+
+    def on_inline_spin_change(self, spin):
+        if self._updating:
+            return
+        val = spin.get_value()
+        if -1.0 <= val <= 1.0:
+            self._updating = True
+            self.inline_scale.set_value(val)
+            self._updating = False
+        self.save_selected_speed(val)
+
+    def save_selected_speed(self, val):
+        name = self.selected_name()
+        if not name:
+            return
+        self.config["profiles"][name]["speed"] = round(val, 2)
+        save(self.config)
+        row = self.list.get_selected_row()
+        if row:
+            child = row.get_child()
+            if hasattr(child, 'speed_label'):
+                child.speed_label.set_label(f"{val:+.2f}")
+        self.status_label.set_label(f"{name}: {val:+.2f}")
+
+    def on_add(self, btn):
+        AddEditDialog(self, self.config)
+
+    def on_edit(self, btn):
+        name = self.selected_name()
+        if name:
+            AddEditDialog(self, self.config, profile_name=name)
+
+    def on_delete(self, btn):
+        name = self.selected_name()
+        if not name or name == "default":
+            return
+        del self.config["profiles"][name]
+        save(self.config)
+        self.refresh()
+
+    def on_settings(self, btn):
+        SettingsDialog(self, self.config)
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    app = Gtk.Application(application_id="org.sensadapt.manager")
+    app.connect("activate", lambda a: ManagerWindow(a).present())
+    app.run(sys.argv)
+
+if __name__ == "__main__":
+    main()
